@@ -18,7 +18,7 @@ A lightweight local CLI to run looping live wallpapers on macOS (M-series suppor
 ## Quick Start
 
 ```bash
-git clone https://github.com/<your-username>/livewallpaper-macos.git
+git clone https://github.com/JagguDada01/livewallpaper-macos.git
 cd livewallpaper-macos
 chmod +x livewallpaper
 ./livewallpaper add-auto /absolute/path/to/video.webm
