@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL_ROOT="${TOOL_ROOT:-$HOME/.livewallpaper}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SRC_PATH="$SCRIPT_DIR/src/LiveWallpaperDaemon.swift"
+BIN_PATH="$TOOL_ROOT/livewallpaper-daemon"
+CONFIG_PATH="$TOOL_ROOT/video_path"
+PID_PATH="$TOOL_ROOT/livewallpaper.pid"
+LOG_PATH="$TOOL_ROOT/livewallpaper.log"
+HISTORY_PATH="$TOOL_ROOT/history.log"
+FFMPEG_LOG_PATH="$TOOL_ROOT/ffmpeg.log"
+VIDEO_DIR="$TOOL_ROOT/videos"
+
+usage() {
+  cat <<'EOT'
+Usage:
+  livewallpaper add <video-path>    Save video and launch live wallpaper
+  livewallpaper add-auto <path>     Convert to compatible mp4, save, launch
+  livewallpaper convert <path>      Convert to compatible mp4 only
+  livewallpaper launch              Launch using saved video
+  livewallpaper launch <video-path> Launch immediately with a video
+  livewallpaper stop                Stop running live wallpaper
+  livewallpaper status              Show running status
+  livewallpaper history             Show command history log
+  livewallpaper build               Build native daemon only
+EOT
+}
+
+log_event() {
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  mkdir -p "$TOOL_ROOT" >/dev/null 2>&1 || true
+  printf '%s | %s\n' "$ts" "$*" >> "$HISTORY_PATH" 2>/dev/null || true
+}
+
+die() {
+  log_event "ERROR | $*"
+  echo "Error: $*" >&2
+  exit 1
+}
+
+ensure_dirs() {
+  mkdir -p "$TOOL_ROOT"
+  mkdir -p "$VIDEO_DIR"
+}
+
+resolve_path() {
+  local input="$1"
+  local dir
+  local file
+  if [[ "$input" == /* ]]; then
+    echo "$input"
+    return 0
+  fi
+  dir="$(cd "$(dirname "$input")" && pwd -P)"
+  file="$(basename "$input")"
+  echo "$dir/$file"
+}
+
+build_daemon() {
+  ensure_dirs
+  [[ -f "$SRC_PATH" ]] || die "Missing source file: $SRC_PATH"
+  if [[ ! -f "$BIN_PATH" || "$SRC_PATH" -nt "$BIN_PATH" ]]; then
+    echo "Building native daemon..."
+    xcrun swiftc "$SRC_PATH" -o "$BIN_PATH" -framework AppKit -framework AVFoundation
+    log_event "BUILD | compiled daemon at $BIN_PATH"
+  fi
+}
+
+is_running() {
+  [[ -f "$PID_PATH" ]] || return 1
+  local pid
+  pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+stop_daemon() {
+  local stopped=1
+  if [[ -f "$PID_PATH" ]]; then
+    local pid
+    pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for _ in {1..20}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      stopped=0
+    fi
+    rm -f "$PID_PATH"
+  fi
+
+  if [[ -f "$BIN_PATH" ]] && pgrep -f "$BIN_PATH" >/dev/null 2>&1; then
+    pkill -f "$BIN_PATH" >/dev/null 2>&1 || true
+    stopped=0
+  fi
+
+  if [[ "$stopped" -eq 0 ]]; then
+    echo "Stopped live wallpaper."
+    log_event "STOP | daemon stopped"
+  else
+    echo "Live wallpaper is not running."
+    log_event "STOP | already stopped"
+  fi
+}
+
+convert_to_mp4() {
+  local src_path="${1:-}"
+  [[ -n "$src_path" ]] || die "Missing video path. Run: livewallpaper convert <video-path>"
+
+  local abs_src
+  abs_src="$(resolve_path "$src_path")"
+  [[ -f "$abs_src" ]] || die "Video file not found: $abs_src"
+
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required for conversion. Install with: brew install ffmpeg"
+
+  ensure_dirs
+
+  local filename
+  local basename_no_ext
+  local output_path
+  filename="$(basename "$abs_src")"
+  basename_no_ext="${filename%.*}"
+  output_path="$VIDEO_DIR/${basename_no_ext}_h264.mp4"
+
+  echo "Converting video to mp4 (H.264): $abs_src" >&2
+  if ffmpeg -y -i "$abs_src" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -an "$output_path" >"$FFMPEG_LOG_PATH" 2>&1; then
+    log_event "CONVERT | src=$abs_src out=$output_path"
+    echo "Converted video: $output_path" >&2
+    printf '%s\n' "$output_path"
+  else
+    log_event "CONVERT_FAILED | src=$abs_src log=$FFMPEG_LOG_PATH"
+    echo "Conversion failed. Recent ffmpeg log:" >&2
+    tail -n 40 "$FFMPEG_LOG_PATH" >&2 || true
+    exit 1
+  fi
+}
+
+launch_daemon() {
+  ensure_dirs
+  local video_path="${1:-}"
+
+  if [[ -n "$video_path" ]]; then
+    video_path="$(resolve_path "$video_path")"
+  elif [[ -f "$CONFIG_PATH" ]]; then
+    video_path="$(cat "$CONFIG_PATH")"
+  else
+    die "No saved video path. Run: livewallpaper add <video-path>"
+  fi
+
+  [[ -f "$video_path" ]] || die "Video file not found: $video_path"
+
+  build_daemon
+  stop_daemon >/dev/null 2>&1 || true
+
+  nohup "$BIN_PATH" --video "$video_path" >"$LOG_PATH" 2>&1 &
+  echo "$!" > "$PID_PATH"
+  sleep 1
+
+  if is_running; then
+    echo "Live wallpaper running with: $video_path"
+    echo "Log file: $LOG_PATH"
+    log_event "LAUNCH | video=$video_path"
+  else
+    echo "Failed to launch live wallpaper. Recent logs:" >&2
+    tail -n 30 "$LOG_PATH" >&2 || true
+    log_event "LAUNCH_FAILED | video=$video_path log=$LOG_PATH"
+    exit 1
+  fi
+}
+
+add_wallpaper() {
+  local video_path="${1:-}"
+  [[ -n "$video_path" ]] || die "Missing video path. Run: livewallpaper add <video-path>"
+  video_path="$(resolve_path "$video_path")"
+  [[ -f "$video_path" ]] || die "Video file not found: $video_path"
+  ensure_dirs
+  printf '%s\n' "$video_path" > "$CONFIG_PATH"
+  echo "Saved video path: $video_path"
+  log_event "ADD | saved=$video_path"
+  launch_daemon "$video_path"
+}
+
+add_auto_wallpaper() {
+  local src_path="${1:-}"
+  [[ -n "$src_path" ]] || die "Missing video path. Run: livewallpaper add-auto <video-path>"
+  local converted_path
+  converted_path="$(convert_to_mp4 "$src_path")"
+  add_wallpaper "$converted_path"
+}
+
+show_status() {
+  if is_running; then
+    local pid
+    pid="$(cat "$PID_PATH")"
+    echo "Status: running (pid $pid)"
+    if [[ -f "$CONFIG_PATH" ]]; then
+      echo "Video: $(cat "$CONFIG_PATH")"
+    fi
+  else
+    echo "Status: stopped"
+    if [[ -f "$CONFIG_PATH" ]]; then
+      echo "Saved video: $(cat "$CONFIG_PATH")"
+    fi
+  fi
+  log_event "STATUS | requested"
+}
+
+show_history() {
+  ensure_dirs
+  if [[ -f "$HISTORY_PATH" ]]; then
+    tail -n 100 "$HISTORY_PATH"
+  else
+    echo "No history yet."
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    add)
+      shift
+      add_wallpaper "${1:-}"
+      ;;
+    add-auto)
+      shift
+      add_auto_wallpaper "${1:-}"
+      ;;
+    convert)
+      shift
+      convert_to_mp4 "${1:-}"
+      ;;
+    launch)
+      shift
+      launch_daemon "${1:-}"
+      ;;
+    stop)
+      stop_daemon
+      ;;
+    status)
+      show_status
+      ;;
+    history)
+      show_history
+      ;;
+    build)
+      build_daemon
+      echo "Build complete: $BIN_PATH"
+      ;;
+    ""|-h|--help|help)
+      usage
+      ;;
+    *)
+      usage
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
