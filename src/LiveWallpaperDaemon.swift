@@ -24,12 +24,21 @@ final class PlayerContainerView: NSView {
 }
 
 final class LiveWallpaperController {
+    private struct ScreenSignature: Equatable {
+        let id: CGDirectDisplayID
+        let frame: CGRect
+        let scale: CGFloat
+    }
+
     private let videoURL: URL
     private var windows: [NSWindow] = []
     private var players: [AVQueuePlayer] = []
     private var loopers: [AVPlayerLooper] = []
     private var screenObserver: NSObjectProtocol?
     private var itemObservers: [NSObjectProtocol] = []
+    private var playbackWatchdog: Timer?
+    private var activityToken: NSObjectProtocol?
+    private var lastScreenSignature: [ScreenSignature] = []
 
     init(videoURL: URL) {
         self.videoURL = videoURL
@@ -43,11 +52,28 @@ final class LiveWallpaperController {
         for observer in itemObservers {
             center.removeObserver(observer)
         }
+        playbackWatchdog?.invalidate()
+        if let activityToken {
+            ProcessInfo.processInfo.endActivity(activityToken)
+        }
     }
 
     func start() {
+        beginPlaybackActivity()
         buildWindows()
+        lastScreenSignature = currentScreenSignature()
         registerObservers()
+        startPlaybackWatchdog()
+    }
+
+    private func beginPlaybackActivity() {
+        guard activityToken == nil else {
+            return
+        }
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "Keep live wallpaper playback active"
+        )
     }
 
     private func registerObservers() {
@@ -60,11 +86,37 @@ final class LiveWallpaperController {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.rebuildWindows()
+            self?.handleScreenConfigurationChange()
         }
     }
 
+    private func handleScreenConfigurationChange() {
+        let signature = currentScreenSignature()
+        guard signature != lastScreenSignature else {
+            return
+        }
+        lastScreenSignature = signature
+        rebuildWindows()
+    }
+
+    private func currentScreenSignature() -> [ScreenSignature] {
+        return NSScreen.screens.compactMap { screen in
+            guard
+                let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            else {
+                return nil
+            }
+            return ScreenSignature(
+                id: CGDirectDisplayID(truncating: number),
+                frame: screen.frame,
+                scale: screen.backingScaleFactor
+            )
+        }
+        .sorted { $0.id < $1.id }
+    }
+
     private func rebuildWindows() {
+        let resumeTime = players.first?.currentTime()
         let center = NotificationCenter.default
         for observer in itemObservers {
             center.removeObserver(observer)
@@ -78,6 +130,46 @@ final class LiveWallpaperController {
         players.removeAll()
         windows.removeAll()
         buildWindows()
+        lastScreenSignature = currentScreenSignature()
+        resumePlaybackIfPossible(at: resumeTime)
+    }
+
+    private func resumePlaybackIfPossible(at time: CMTime?) {
+        guard
+            let time,
+            time.isNumeric,
+            time.seconds.isFinite,
+            !time.seconds.isNaN
+        else {
+            return
+        }
+        for player in players {
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            player.play()
+        }
+    }
+
+    private func startPlaybackWatchdog() {
+        guard playbackWatchdog == nil else {
+            return
+        }
+        playbackWatchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.ensurePlayback()
+        }
+    }
+
+    private func ensurePlayback() {
+        for (index, player) in players.enumerated() {
+            guard player.currentItem != nil else {
+                continue
+            }
+            if player.timeControlStatus != .playing {
+                player.play()
+                if index < windows.count {
+                    windows[index].orderFrontRegardless()
+                }
+            }
+        }
     }
 
     private func buildWindows() {
@@ -106,6 +198,7 @@ final class LiveWallpaperController {
 
             let player = AVQueuePlayer()
             player.isMuted = true
+            player.automaticallyWaitsToMinimizeStalling = false
             let item = AVPlayerItem(url: videoURL)
             let failedObserver = NotificationCenter.default.addObserver(
                 forName: .AVPlayerItemFailedToPlayToEndTime,
@@ -120,7 +213,7 @@ final class LiveWallpaperController {
             let looper = AVPlayerLooper(player: player, templateItem: item)
             container.playerLayer.player = player
 
-            window.orderBack(nil)
+            window.orderFrontRegardless()
             player.play()
 
             windows.append(window)

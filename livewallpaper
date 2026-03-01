@@ -41,8 +41,7 @@ die() {
 }
 
 ensure_dirs() {
-  mkdir -p "$TOOL_ROOT"
-  mkdir -p "$VIDEO_DIR"
+  mkdir -p "$TOOL_ROOT" "$VIDEO_DIR"
 }
 
 resolve_path() {
@@ -58,6 +57,12 @@ resolve_path() {
   echo "$dir/$file"
 }
 
+read_file_value() {
+  local path="$1"
+  [[ -f "$path" ]] || return 1
+  cat "$path" 2>/dev/null || return 1
+}
+
 build_daemon() {
   ensure_dirs
   [[ -f "$SRC_PATH" ]] || die "Missing source file: $SRC_PATH"
@@ -69,9 +74,8 @@ build_daemon() {
 }
 
 is_running() {
-  [[ -f "$PID_PATH" ]] || return 1
   local pid
-  pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+  pid="$(read_file_value "$PID_PATH" || true)"
   [[ -n "$pid" ]] || return 1
   kill -0 "$pid" 2>/dev/null
 }
@@ -80,7 +84,7 @@ stop_daemon() {
   local stopped=1
   if [[ -f "$PID_PATH" ]]; then
     local pid
-    pid="$(cat "$PID_PATH" 2>/dev/null || true)"
+    pid="$(read_file_value "$PID_PATH" || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       for _ in {1..20}; do
@@ -150,7 +154,7 @@ launch_daemon() {
   if [[ -n "$video_path" ]]; then
     video_path="$(resolve_path "$video_path")"
   elif [[ -f "$CONFIG_PATH" ]]; then
-    video_path="$(cat "$CONFIG_PATH")"
+    video_path="$(read_file_value "$CONFIG_PATH" || true)"
   else
     die "No saved video path. Run: livewallpaper add <video-path>"
   fi
@@ -165,8 +169,6 @@ launch_daemon() {
   sleep 1
 
   if is_running; then
-    echo "Live wallpaper running with: $video_path"
-    echo "Log file: $LOG_PATH"
     log_event "LAUNCH | video=$video_path"
   else
     echo "Failed to launch live wallpaper. Recent logs:" >&2
@@ -197,17 +199,20 @@ add_auto_wallpaper() {
 }
 
 show_status() {
+  local saved_video
+  saved_video="$(read_file_value "$CONFIG_PATH" || true)"
+
   if is_running; then
     local pid
-    pid="$(cat "$PID_PATH")"
+    pid="$(read_file_value "$PID_PATH" || true)"
     echo "Status: running (pid $pid)"
-    if [[ -f "$CONFIG_PATH" ]]; then
-      echo "Video: $(cat "$CONFIG_PATH")"
+    if [[ -n "$saved_video" ]]; then
+      echo "Video: $saved_video"
     fi
   else
     echo "Status: stopped"
-    if [[ -f "$CONFIG_PATH" ]]; then
-      echo "Saved video: $(cat "$CONFIG_PATH")"
+    if [[ -n "$saved_video" ]]; then
+      echo "Saved video: $saved_video"
     fi
   fi
   log_event "STATUS | requested"
